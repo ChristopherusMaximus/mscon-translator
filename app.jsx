@@ -31,8 +31,8 @@ function pad(n, size = 2) {
   return s.length >= size ? s : "0".repeat(size - s.length) + s;
 }
 
-// Local EDIFACT date-time with "?+00" + :303 qualifier.
-// (We keep ?+00 for compatibility with your existing parser expectations.)
+// UTC EDIFACT date-time with "?+00" + :303 qualifier.
+// IMPORTANT: must be UTC to match your working MSCONS examples.
 function formatEdifactDateTime(date) {
   const y = date.getUTCFullYear();
   const m = pad(date.getUTCMonth() + 1);
@@ -47,7 +47,7 @@ function seg(tag, ...parts) {
 }
 
 // ----------------------------
-// CSV helper: parse "DD.MM.YYYY HH:MM;..." + value (kWh per 15 min)
+// CSV helper: parse "DD.MM.YYYY HH:MM;15,024" (kWh per 15 min)
 // output: [{dayKey,start,end,values(96)}]
 // ----------------------------
 function parseQuarterHourCSV(text) {
@@ -58,12 +58,15 @@ function parseQuarterHourCSV(text) {
 
   const rows = [];
   for (const line of lines) {
+    // skip obvious headers
+    if (line.toLowerCase().includes("datum") || line.toLowerCase().includes("date")) continue;
+
     // Expected: "DD.MM.YYYY HH:MM;15,024"
     const parts = line.split(";");
     if (parts.length < 2) continue;
 
-    const left = parts[0].trim();          // "DD.MM.YYYY HH:MM"
-    const valStrRaw = parts[1].trim();     // "15,024"
+    const left = parts[0].trim();               // "DD.MM.YYYY HH:MM"
+    const valStrRaw = parts[1].trim();          // "15,024"
     const valStr = valStrRaw.replace(",", "."); // "15.024"
 
     const m = left.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$/);
@@ -77,8 +80,8 @@ function parseQuarterHourCSV(text) {
 
     // local timestamp = interval START
     const ts = new Date(yy, mm - 1, dd, HH, MM);
-    const v = Number(valStr);
 
+    const v = Number(valStr);
     rows.push({ ts, v: Number.isFinite(v) ? v : 0 });
   }
 
@@ -100,10 +103,10 @@ function parseQuarterHourCSV(text) {
     const [Y, M, D] = dayKey.split("-").map(Number);
     const start = new Date(Y, M - 1, D, 0, 0, 0, 0);
 
-    // expected 96 timestamps
+    // expected 96 timestamps (local)
     const expected = new Map();
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
+      const t = new Date(start.getTime() + i * SLOT_MS);
       expected.set(t.getTime(), 0);
     }
 
@@ -114,7 +117,7 @@ function parseQuarterHourCSV(text) {
 
     const values = [];
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
+      const t = new Date(start.getTime() + i * SLOT_MS);
       values.push(expected.get(t.getTime()) || 0);
     }
 
@@ -139,15 +142,16 @@ function buildMSCONS(options) {
   const rand = Math.floor(Math.random() * 9_000_000) + 1_000_000;
 
   const interchangeRef = `D${rand}`;
-  const msgRef = `MS${rand}${pad(now.getSeconds(), 2)}`;
+  const msgRef = `MS${rand}${pad(now.getUTCSeconds(), 2)}`;
 
   const segments = [];
   segments.push("UNA:+.? '");
 
-  // UNB time stamp: use local clock format YYMMDD:HHMM (no timezone)
+  // UNB timestamp (keep like legacy: YYMMDD:HHMM)
+  // We use UTC here to be consistent.
   const unbStamp =
-    `${pad(now.getFullYear() % 100)}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
-    `:${pad(now.getHours())}${pad(now.getMinutes())}`;
+    `${pad(now.getUTCFullYear() % 100)}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
+    `:${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
 
   segments.push(
     seg(
@@ -165,35 +169,33 @@ function buildMSCONS(options) {
   const msg = [];
   msg.push(seg("UNH", msgRef, "MSCONS:D:04B:UN:2.4c"));
   msg.push(seg("BGM", "Z48", msgRef, "9"));
-  msg.push(seg("DTM", `137:${formatEdifactDateTimeLocal(now)}:303`));
+  msg.push(seg("DTM", `137:${formatEdifactDateTime(now)}:303`));
   msg.push(seg("RFF", "Z13:13025"));
   msg.push(seg("NAD", "MS", `${SENDER_ID}::293`));
   msg.push(seg("NAD", "MR", `${RECIPIENT_ID}::293`));
   msg.push(seg("UNS", "D"));
   msg.push(seg("NAD", "DP"));
 
-  // LOC+172 should be MeLo (your locId)
   msg.push(seg("LOC", "172", locId));
 
-  // Day header boundaries (local clock)
-  msg.push(seg("DTM", `163:${formatEdifactDateTimeLocal(start)}:303`));
-  msg.push(seg("DTM", `164:${formatEdifactDateTimeLocal(end)}:303`));
+  // Header boundaries MUST match settlement day convention (22:00Z..22:00Z)
+  msg.push(seg("DTM", `163:${formatEdifactDateTime(start)}:303`));
+  msg.push(seg("DTM", `164:${formatEdifactDateTime(end)}:303`));
 
   msg.push(seg("LIN", "1"));
   msg.push(seg("PIA", "5", `1-0?:${obis}:SRW`));
 
-  // Some parsers expect a non-zero initial quantity (matches working examples)
-const firstVal = (values && values.length ? values[0] : 0.001);
-const initVal = Math.max(0.001, Number(firstVal) || 0.001);
-msg.push(seg("QTY", `220:${initVal.toFixed(3)}`));
+  // initial QTY (non-zero, matches working examples and avoids strict parser crashes)
+  const firstVal = values && values.length ? values[0] : 0.001;
+  const initVal = Math.max(0.001, Number(firstVal) || 0.001);
+  msg.push(seg("QTY", `220:${initVal.toFixed(3)}`));
 
   let t = new Date(start.getTime());
   for (const v of values) {
     const tNext = new Date(t.getTime() + SLOT_MS);
-    msg.push(seg("DTM", `163:${formatEdifactDateTimeLocal(t)}:303`));
-    msg.push(seg("DTM", `164:${formatEdifactDateTimeLocal(tNext)}:303`));
+    msg.push(seg("DTM", `163:${formatEdifactDateTime(t)}:303`));
+    msg.push(seg("DTM", `164:${formatEdifactDateTime(tNext)}:303`));
 
-    // Keep numeric stable; no scientific notation
     const num = Number.isFinite(v) ? Number(v) : 0;
     const out = num.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
     msg.push(seg("QTY", `220:${out}`));
@@ -201,7 +203,6 @@ msg.push(seg("QTY", `220:${initVal.toFixed(3)}`));
     t = tNext;
   }
 
-  // UNT count: in your working example, this is consistent with "msg.length + 1"
   msg.push(seg("UNT", String(msg.length + 1), msgRef));
 
   segments.push(...msg);
@@ -275,12 +276,18 @@ function MSCONSGenerator() {
       const parsed = parseQuarterHourCSV(text);
 
       if (!parsed.length) {
-        throw new Error(
-          "CSV enthält keine lesbaren Zeilen. Erwartet: DD.MM.YYYY HH:MM;... , <kWh>"
-        );
+        throw new Error("CSV enthält keine lesbaren Zeilen. Erwartet: DD.MM.YYYY HH:MM;15,024");
       }
-      const bad = parsed.find((d) => !d.values || d.values.length !== 96);
-      if (bad) throw new Error(`Tag ${bad.dayKey} hat nicht exakt 96 Werte.`);
+
+      // Hard validation: every day must have 96 values and no NaNs
+      for (const d of parsed) {
+        if (!d.values || d.values.length !== 96) {
+          throw new Error(`Tag ${d.dayKey} hat nicht exakt 96 Werte (hat ${d.values ? d.values.length : 0}).`);
+        }
+        if (d.values.some((v) => !Number.isFinite(v))) {
+          throw new Error(`Tag ${d.dayKey} enthält ungültige Werte (NaN).`);
+        }
+      }
 
       setCsvDays(parsed);
     } catch (e) {
@@ -349,10 +356,9 @@ function MSCONSGenerator() {
             kind +
             ".txt";
 
-          // IMPORTANT: Market-compatible settlement day (DE) -> 22:00 UTC to 22:00 UTC
-         // This matches your working MSCONS examples.
-            const startBase = new Date(`${d.dayKey}T22:00:00Z`);
-            const endBase = new Date(startBase.getTime() + 24 * 3600 * 1000);
+          // Market-compatible settlement day (DE): 22:00 UTC to 22:00 UTC
+          const startBase = new Date(`${d.dayKey}T22:00:00Z`);
+          const endBase = new Date(startBase.getTime() + 24 * 3600 * 1000);
 
           const content = buildMSCONS({
             locId,
