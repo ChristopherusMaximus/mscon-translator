@@ -174,9 +174,11 @@ function buildMSCONS(options) {
   msg.push(seg("NAD", "MS", `${SENDER_ID}::293`));
   msg.push(seg("NAD", "MR", `${RECIPIENT_ID}::293`));
   msg.push(seg("UNS", "D"));
-  msg.push(seg("NAD", "DP"));
+// IMPORTANT: workaround for platform parser
+// It expects NAD+DP+... (at least one more element) - otherwise it may misread next segment (LOC)
+   msg.push(seg("NAD", "DP", ""));
 
-  msg.push(seg("LOC", "172", locId));
+   msg.push(seg("LOC", "172", locId));
 
   // Header boundaries MUST match settlement day convention (22:00Z..22:00Z)
   msg.push(seg("DTM", `163:${formatEdifactDateTime(start)}:303`));
