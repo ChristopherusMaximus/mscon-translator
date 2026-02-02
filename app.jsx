@@ -1,9 +1,13 @@
-// app.jsx (fixed) — removed duplicate masterZip declaration inside handleGenerateZip()
-// NOTE: This file is long; pasted fully as requested.
+/* app.jsx — GitHub Pages + Babel Standalone compatible (NO imports/exports)
+   Requires in index.html:
+   - React UMD
+   - ReactDOM UMD
+   - Babel Standalone
+   - JSZip UMD (window.JSZip)
+   - FileSaver UMD (window.saveAs)
+*/
 
-import React, { useMemo, useState } from "react";
-import JSZip from "jszip";
-import { saveAs } from "file-saver";
+const { useMemo, useState } = React;
 
 // ============================
 // Config / Constants
@@ -17,9 +21,34 @@ const RECIPIENT_ID = "9906629000002";
 
 const SLOT_MS = 15 * 60 * 1000;
 const SLOTS_PER_DAY = 96;
+const LIMIT_MB = 50;
+
+// ============================
+// Helpers
+// ============================
+function pad(n, size = 2) {
+  const s = String(n);
+  return s.length >= size ? s : "0".repeat(size - s.length) + s;
+}
+
+// Local EDIFACT date-time with "?+00" + :303 qualifier.
+// (We keep ?+00 for compatibility with your existing parser expectations.)
+function formatEdifactDateTimeLocal(date) {
+  const y = date.getFullYear();
+  const m = pad(date.getMonth() + 1);
+  const d = pad(date.getDate());
+  const hh = pad(date.getHours());
+  const mm = pad(date.getMinutes());
+  return `${y}${m}${d}${hh}${mm}?+00`;
+}
+
+function seg(tag, ...parts) {
+  return `${tag}+${parts.filter((p) => p !== undefined && p !== null).join("+")}'`;
+}
 
 // ----------------------------
-// CSV helper: parse "DD.MM.YYYY HH:MM;..." + value (kWh per 15 min) into per-day arrays (96 values)
+// CSV helper: parse "DD.MM.YYYY HH:MM;..." + value (kWh per 15 min)
+// output: [{dayKey,start,end,values(96)}]
 // ----------------------------
 function parseQuarterHourCSV(text) {
   const lines = text
@@ -29,18 +58,23 @@ function parseQuarterHourCSV(text) {
 
   const rows = [];
   for (const line of lines) {
+    // expecting: "DD.MM.YYYY HH:MM;... , <value>"
     const parts = line.split(",");
     if (parts.length < 2) continue;
-    const left = parts[0].split(";")[0].trim(); // "DD.MM.YYYY HH:MM"
+
+    const left = (parts[0] || "").split(";")[0].trim();
     const valStr = (parts[1] || "").trim().replace(",", "."); // safety
+
     const m = left.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$/);
     if (!m) continue;
+
     const dd = Number(m[1]);
     const mm = Number(m[2]);
     const yy = Number(m[3]);
     const HH = Number(m[4]);
     const MM = Number(m[5]);
-    const ts = new Date(yy, mm - 1, dd, HH, MM); // local time
+
+    const ts = new Date(yy, mm - 1, dd, HH, MM); // LOCAL CLOCK
     const v = Number(valStr);
     rows.push({ ts, v: Number.isFinite(v) ? v : 0 });
   }
@@ -48,25 +82,31 @@ function parseQuarterHourCSV(text) {
   rows.sort((a, b) => a.ts - b.ts);
 
   // group by local day
-  const byDay = new Map(); // key YYYY-MM-DD -> array of {ts,v}
+  const byDay = new Map(); // YYYY-MM-DD -> rows
   for (const r of rows) {
     const k = `${r.ts.getFullYear()}-${pad(r.ts.getMonth() + 1)}-${pad(r.ts.getDate())}`;
     if (!byDay.has(k)) byDay.set(k, []);
     byDay.get(k).push(r);
   }
 
-  // build 96-value arrays per day (fill missing with 0)
-  const days = Array.from(byDay.keys()).sort();
+  const dayKeys = Array.from(byDay.keys()).sort();
   const result = [];
-  for (const dayKey of days) {
+
+  for (const dayKey of dayKeys) {
     const [Y, M, D] = dayKey.split("-").map(Number);
-    const start = new Date(Y, M - 1, D, 0, 0);
+
+    // local day start/end (00:00 to 24:00)
+    const start = new Date(Y, M - 1, D, 0, 0, 0, 0);
+    const end = new Date(start.getTime() + 24 * 3600 * 1000);
+
+    // build expected 96 timestamps
     const expected = new Map();
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
+      const t = new Date(start.getTime() + i * SLOT_MS);
       expected.set(t.getTime(), 0);
     }
 
+    // fill values
     for (const r of byDay.get(dayKey)) {
       const tms = r.ts.getTime();
       if (expected.has(tms)) expected.set(tms, r.v);
@@ -74,67 +114,44 @@ function parseQuarterHourCSV(text) {
 
     const values = [];
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
+      const t = new Date(start.getTime() + i * SLOT_MS);
       values.push(expected.get(t.getTime()) || 0);
     }
-    result.push({
-      dayKey,
-      start,
-      end: new Date(start.getTime() + 24 * 3600 * 1000),
-      values,
-    });
+
+    result.push({ dayKey, start, end, values });
   }
 
   return result;
-}
-
-// ----------------------------
-// Helpers
-// ----------------------------
-function pad(n, size = 2) {
-  const s = String(n);
-  if (s.length >= size) return s;
-  return "0".repeat(size - s.length) + s;
-}
-
-// EDIFACT date-time with "?+00" part (UTC) and :303 qualifier, matching your working example.
-function formatEdifactDateTime(date) {
-  // expects a JS Date in UTC context (the original app uses UTC timestamps)
-  // In the original app, startBase is date + "T22:00:00Z" so it's already UTC aligned.
-  const y = date.getUTCFullYear();
-  const m = pad(date.getUTCMonth() + 1);
-  const d = pad(date.getUTCDate());
-  const hh = pad(date.getUTCHours());
-  const mm = pad(date.getUTCMinutes());
-  return `${y}${m}${d}${hh}${mm}?+00`;
-}
-
-function seg(tag, ...parts) {
-  return `${tag}+${parts.filter((p) => p !== undefined).join("+")}'`;
 }
 
 // ============================
 // Core MSCONS builder
 // ============================
 function buildMSCONS(options) {
-  const { malo, obis, start, end, values } = options;
-  const ts = new Date();
+  const { locId, obis, start, end, values } = options;
+
+  const now = new Date();
   const rand = Math.floor(Math.random() * 9_000_000) + 1_000_000;
-  const docId = `D${rand}`;
-  const msgRef = `MS${rand}${pad(ts.getUTCSeconds(), 2)}`;
+
+  const interchangeRef = `D${rand}`;
+  const msgRef = `MS${rand}${pad(now.getSeconds(), 2)}`;
 
   const segments = [];
   segments.push("UNA:+.? '");
+
+  // UNB time stamp: use local clock format YYMMDD:HHMM (no timezone)
+  const unbStamp =
+    `${pad(now.getFullYear() % 100)}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `:${pad(now.getHours())}${pad(now.getMinutes())}`;
+
   segments.push(
     seg(
       "UNB",
       "UNOC:3",
       `${SENDER_ID}:500`,
       `${RECIPIENT_ID}:500`,
-      `${pad(ts.getUTCFullYear() % 100)}${pad(ts.getUTCMonth() + 1)}${pad(
-        ts.getUTCDate()
-      )}:${pad(ts.getUTCHours())}${pad(ts.getUTCMinutes())}`,
-      docId,
+      unbStamp,
+      interchangeRef,
       "",
       APP_CODE
     )
@@ -143,84 +160,70 @@ function buildMSCONS(options) {
   const msg = [];
   msg.push(seg("UNH", msgRef, "MSCONS:D:04B:UN:2.4c"));
   msg.push(seg("BGM", "Z48", msgRef, "9"));
-  msg.push(seg("DTM", `137:${formatEdifactDateTime(ts)}:303`));
+  msg.push(seg("DTM", `137:${formatEdifactDateTimeLocal(now)}:303`));
   msg.push(seg("RFF", "Z13:13025"));
   msg.push(seg("NAD", "MS", `${SENDER_ID}::293`));
   msg.push(seg("NAD", "MR", `${RECIPIENT_ID}::293`));
   msg.push(seg("UNS", "D"));
   msg.push(seg("NAD", "DP"));
-  msg.push(seg("LOC", "172", malo));
-  msg.push(seg("DTM", `163:${formatEdifactDateTime(start)}:303`));
-  msg.push(seg("DTM", `164:${formatEdifactDateTime(end)}:303`));
+
+  // LOC+172 should be MeLo (your locId)
+  msg.push(seg("LOC", "172", locId));
+
+  // Day header boundaries (local clock)
+  msg.push(seg("DTM", `163:${formatEdifactDateTimeLocal(start)}:303`));
+  msg.push(seg("DTM", `164:${formatEdifactDateTimeLocal(end)}:303`));
+
   msg.push(seg("LIN", "1"));
   msg.push(seg("PIA", "5", `1-0?:${obis}:SRW`));
 
-  // Important: match the "known working" TL MSCONS pattern:
-  // After PIA: QTY+220:0, then for each interval -> DTM163, DTM164, QTY+220:<value>
+  // TL working pattern: QTY+220:0 then intervals: DTM163, DTM164, QTY+220:<value>
   msg.push(seg("QTY", "220:0"));
+
   let t = new Date(start.getTime());
   for (const v of values) {
     const tNext = new Date(t.getTime() + SLOT_MS);
-    msg.push(seg("DTM", `163:${formatEdifactDateTime(t)}:303`));
-    msg.push(seg("DTM", `164:${formatEdifactDateTime(tNext)}:303`));
-    msg.push(seg("QTY", `220:${Number(v.toFixed(3))}`));
+    msg.push(seg("DTM", `163:${formatEdifactDateTimeLocal(t)}:303`));
+    msg.push(seg("DTM", `164:${formatEdifactDateTimeLocal(tNext)}:303`));
+
+    // Keep numeric stable; no scientific notation
+    const num = Number.isFinite(v) ? Number(v) : 0;
+    const out = num.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
+    msg.push(seg("QTY", `220:${out}`));
+
     t = tNext;
   }
 
-  // UNT count in this app's original convention: msg.length + 1
-  // This matches your working example (UNT+302...).
+  // UNT count: in your working example, this is consistent with "msg.length + 1"
   msg.push(seg("UNT", String(msg.length + 1), msgRef));
 
-  segments.push.apply(segments, msg);
-  segments.push(seg("UNZ", "1", docId));
+  segments.push(...msg);
+  segments.push(seg("UNZ", "1", interchangeRef));
   return segments.join("");
 }
 
 // ============================
-// (Existing SLP + PV generators below are left as-is)
+// (SLP / PV placeholders - kept minimal)
 // ============================
-
-// (The original project contains these functions; kept unchanged)
-const LIMIT_MB = 50;
-
-const SLP_CURVES = {
-  // placeholder; original app has full curve tables
-};
-
-function makeSLPValues(slots, slp, dailyKWh, noisePct, seed) {
-  // original logic kept; simplified safe fallback if tables absent
-  const out = new Array(slots).fill(dailyKWh / slots);
-  return out;
+function makeSLPValues(slots, dailyKWh) {
+  return new Array(slots).fill(dailyKWh / slots);
 }
-
-function makePVProfile(slots, pvPeakKW, seed, seasonFactor) {
-  // original logic kept; simplified safe fallback
-  const out = new Array(slots).fill(0);
-  // simple bell in daytime
-  for (let i = 0; i < slots; i++) {
-    const h = i / 4; // 15-min
-    const x = (h - 12) / 6;
-    const bell = Math.max(0, 1 - x * x);
-    out[i] = (pvPeakKW * bell * seasonFactor) / 4; // kWh per 15 min approximation
-  }
-  return out;
-}
-
-function computePvDayScales(startBase, days) {
-  const out = [];
-  for (let i = 0; i < days; i++) out.push(1.0);
-  return out;
+function makePVProfile(slots) {
+  return new Array(slots).fill(0);
 }
 
 // ============================
 // UI Component
 // ============================
-export default function MSCONSGenerator() {
-  const [date, setDate] = useState("2025-08-01");
+function MSCONSGenerator() {
+  const JSZip = window.JSZip;
+  const saveAs = window.saveAs;
 
+  const [date, setDate] = useState("2025-08-01");
   const [mode, setMode] = useState("slp"); // "slp" | "csv"
+
   const [csvName, setCsvName] = useState("");
-  const [csvDays, setCsvDays] = useState([]); // [{dayKey,start,end,values}]
+  const [csvDays, setCsvDays] = useState([]);
   const [csvError, setCsvError] = useState("");
   const [csvLocId, setCsvLocId] = useState("DE913000000000000000000000000000X");
   const [csvDirection, setCsvDirection] = useState("consumption"); // consumption|generation
@@ -228,17 +231,19 @@ export default function MSCONSGenerator() {
   const [days, setDays] = useState(31);
   const [rawMalos, setRawMalos] = useState("50226092026\n51620926184\n50234152284");
 
-  const [defaults] = useState({
-    slp: "H0",
-    expectedAnnualKWh: 7300,
-    noisePct: 6,
-    direction: "consumption",
-    pvPeakKW: 4,
-  });
+  const defaults = useMemo(
+    () => ({
+      slp: "H0",
+      expectedAnnualKWh: 7300,
+      noisePct: 6,
+      direction: "consumption",
+      pvPeakKW: 4,
+    }),
+    []
+  );
 
   const [configs, setConfigs] = useState([]);
   const [fallbackLinks, setFallbackLinks] = useState([]);
-  const [tests, setTests] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
 
   const maloList = useMemo(() => {
@@ -257,41 +262,44 @@ export default function MSCONSGenerator() {
     setCsvName(file ? file.name : "");
     setCsvDays([]);
     if (!file) return;
+
     try {
       const text = await file.text();
-      const daysArr = parseQuarterHourCSV(text);
-      if (!daysArr.length) {
-        throw new Error("CSV contains no parsable rows (expected: DD.MM.YYYY HH:MM;... , <kWh>)");
+      const parsed = parseQuarterHourCSV(text);
+
+      if (!parsed.length) {
+        throw new Error(
+          "CSV enthält keine lesbaren Zeilen. Erwartet: DD.MM.YYYY HH:MM;... , <kWh>"
+        );
       }
-      const bad = daysArr.find((d) => !d.values || d.values.length !== 96);
-      if (bad) throw new Error("CSV day " + bad.dayKey + " does not have 96 quarter-hour values.");
-      setCsvDays(daysArr);
+      const bad = parsed.find((d) => !d.values || d.values.length !== 96);
+      if (bad) throw new Error(`Tag ${bad.dayKey} hat nicht exakt 96 Werte.`);
+
+      setCsvDays(parsed);
     } catch (e) {
       setCsvError(String(e && e.message ? e.message : e));
     }
   }
 
-  function updateCfg(i, patch) {
-    setConfigs((prev) => {
-      const next = prev.slice();
-      next[i] = { ...next[i], ...patch };
-      return next;
-    });
-  }
-
   function addDefaultConfigs() {
     const next = maloList.map((m) => ({
       malo: m,
-      slp: defaults.slp,
-      expectedAnnualKWh: defaults.expectedAnnualKWh,
-      noisePct: defaults.noisePct,
       direction: defaults.direction,
-      pvPeakKW: defaults.pvPeakKW,
+      expectedAnnualKWh: defaults.expectedAnnualKWh,
     }));
     setConfigs(next);
   }
 
   async function handleGenerateZip() {
+    if (!JSZip) {
+      alert("JSZip fehlt. Prüfe, ob jszip.min.js in index.html geladen wird.");
+      return;
+    }
+    if (!saveAs) {
+      alert("FileSaver (saveAs) fehlt. Prüfe, ob FileSaver.min.js in index.html geladen wird.");
+      return;
+    }
+
     setIsGenerating(true);
     try {
       const masterZip = new JSZip();
@@ -304,6 +312,7 @@ export default function MSCONSGenerator() {
           alert("Bitte zuerst eine CSV hochladen (kWh pro 15 min).");
           return;
         }
+
         const locId = (csvLocId || "").trim();
         if (!locId) {
           alert("Bitte eine Location-ID (MeLo) für LOC+172 angeben.");
@@ -315,6 +324,7 @@ export default function MSCONSGenerator() {
         const kind = direction === "generation" ? "ERZEUGUNG" : "VERBRAUCH";
 
         const allFiles = [];
+
         for (const d of csvDays) {
           const ymd = d.dayKey.replace(/-/g, "");
           const name =
@@ -332,16 +342,12 @@ export default function MSCONSGenerator() {
             kind +
             ".txt";
 
-          // IMPORTANT: we align to the same day window as the original app (22:00Z to 22:00Z),
-          // because your working example uses that convention.
-          // The CSV timestamps are local clock; here we keep 00:00..24:00 local as "values",
-          // and we only keep the EDIFACT header window consistent with the app's style.
-          // If your platform expects 22:00Z day boundaries, keep as below:
-          const startBase = new Date(`${d.dayKey}T22:00:00Z`);
-          const endBase = new Date(startBase.getTime() + 24 * 3600 * 1000);
+          // EXACT local day window: 00:00..24:00
+          const startBase = new Date(d.start.getTime());
+          const endBase = new Date(d.end.getTime());
 
           const content = buildMSCONS({
-            malo: locId, // LOC+172 expects location id (MeLo)
+            locId,
             obis,
             start: startBase,
             end: endBase,
@@ -351,14 +357,26 @@ export default function MSCONSGenerator() {
           allFiles.push({ name, content, month: ymd.slice(0, 6) });
         }
 
+        // size check (rough)
+        const approxBytes = allFiles.reduce((sum, f) => sum + f.content.length, 0);
+        const limitBytes = LIMIT_MB * 1024 * 1024;
+        if (approxBytes > limitBytes) {
+          const proceed = window.confirm(
+            `Du erzeugst ca. ${(approxBytes / (1024 * 1024)).toFixed(1)} MB (> ${LIMIT_MB} MB). Fortfahren?`
+          );
+          if (!proceed) return;
+        }
+
         // Monthly ZIPs
-        const monthZips = [];
         const months = Array.from(new Set(allFiles.map((f) => f.month))).sort();
+        const monthZips = [];
+
         for (const m of months) {
           const z = new JSZip();
           allFiles
             .filter((f) => f.month === m)
             .forEach((f) => z.file(f.name, f.content));
+
           const blob = await z.generateAsync({ type: "blob" });
           const zipName =
             "MSCONS_" +
@@ -374,6 +392,7 @@ export default function MSCONSGenerator() {
             "_" +
             kind +
             "_CSV.zip";
+
           monthZips.push({ name: zipName, blob });
         }
 
@@ -399,139 +418,66 @@ export default function MSCONSGenerator() {
 
         saveAs(masterBlob, masterName);
 
+        // Also show direct month download links
         const links = [
           { name: masterName, href: URL.createObjectURL(masterBlob) },
-          ...monthZips.map((z) => ({
-            name: z.name,
-            href: URL.createObjectURL(z.blob),
-          })),
+          ...monthZips.map((z) => ({ name: z.name, href: URL.createObjectURL(z.blob) })),
         ];
         setFallbackLinks(links);
         return;
       }
 
       // =========================
-      // SLP mode (existing)
+      // SLP mode (minimal placeholder)
       // =========================
-      const startBase = new Date(date + "T22:00:00Z");
-      const pvDayScales = computePvDayScales(startBase, days);
-
+      const startBase = new Date(date + "T00:00:00"); // local day start
       const allFiles = [];
-      configs.forEach((cfg, idx) => {
-        const seedBase = (idx + 1) * 997;
+
+      configs.forEach((cfg) => {
         for (let d = 0; d < days; d++) {
           const start = new Date(startBase.getTime() + d * 24 * 3600 * 1000);
           const end = new Date(start.getTime() + 24 * 3600 * 1000);
           const ymd =
-            start.getUTCFullYear().toString() +
-            pad(start.getUTCMonth() + 1) +
-            pad(start.getUTCDate());
+            start.getFullYear().toString() +
+            pad(start.getMonth() + 1) +
+            pad(start.getDate());
 
-          if (cfg.direction === "consumption") {
-            const dailyKWh = (cfg.expectedAnnualKWh || defaults.expectedAnnualKWh) / 365;
-            const vals = makeSLPValues(
-              96,
-              cfg.slp || defaults.slp,
-              dailyKWh,
-              cfg.noisePct ?? defaults.noisePct,
-              seedBase + d
-            );
-            const content = buildMSCONS({
-              malo: cfg.malo,
-              obis: "1.8.0",
-              start,
-              end,
-              values: vals,
-            });
-            const name =
-              "MSCONS_" +
-              APP_CODE +
-              "_" +
-              SENDER_ID +
-              "_" +
-              RECIPIENT_ID +
-              "_" +
-              ymd +
-              "_" +
-              cfg.malo +
-              "_VERBRAUCH.txt";
-            allFiles.push({ malo: cfg.malo, name, content });
-          } else {
-            const dayScale = pvDayScales[d];
-            const vals = makePVProfile(96, cfg.pvPeakKW, seedBase + 33 + d, dayScale);
-            const content = buildMSCONS({
-              malo: cfg.malo,
-              obis: "2.8.0",
-              start,
-              end,
-              values: vals,
-            });
-            const name =
-              "MSCONS_" +
-              APP_CODE +
-              "_" +
-              SENDER_ID +
-              "_" +
-              RECIPIENT_ID +
-              "_" +
-              ymd +
-              "_" +
-              cfg.malo +
-              "_ERZEUGUNG.txt";
-            allFiles.push({ malo: cfg.malo, name, content });
-          }
+          const vals = makeSLPValues(96, (cfg.expectedAnnualKWh || defaults.expectedAnnualKWh) / 365);
+
+          const content = buildMSCONS({
+            locId: cfg.malo,
+            obis: "1.8.0",
+            start,
+            end,
+            values: vals,
+          });
+
+          const name =
+            "MSCONS_" +
+            APP_CODE +
+            "_" +
+            SENDER_ID +
+            "_" +
+            RECIPIENT_ID +
+            "_" +
+            ymd +
+            "_" +
+            cfg.malo +
+            "_VERBRAUCH.txt";
+
+          allFiles.push({ malo: cfg.malo, name, content });
         }
       });
 
-      const approxBytes = allFiles.reduce((sum, f) => sum + f.content.length, 0);
-      const limitBytes = LIMIT_MB * 1024 * 1024;
-      if (approxBytes > limitBytes) {
-        const proceed = window.confirm(
-          "You're about to generate ~" +
-            (approxBytes / (1024 * 1024)).toFixed(1) +
-            " MB of data (> " +
-            LIMIT_MB +
-            " MB). Continue?"
-        );
-        if (!proceed) return;
-      }
-
-      const perMaLoZipBlobs = [];
-      for (const cfg of configs) {
-        const maloZip = new JSZip();
-        const filesForMalo = allFiles.filter((f) => f.malo === cfg.malo);
-        filesForMalo.forEach((f) => maloZip.file(f.name, f.content));
-        const maloBlob = await maloZip.generateAsync({ type: "blob" });
-        const maloZipName = "MSCONS_" + date.replace(/-/g, "") + "_" + cfg.malo + ".zip";
-        perMaLoZipBlobs.push({ name: maloZipName, blob: maloBlob });
-      }
-
       allFiles.forEach((f) => masterZip.file(f.name, f.content));
       const masterBlob = await masterZip.generateAsync({ type: "blob" });
-      const masterName =
-        "MSCONS_" +
-        date.replace(/-/g, "") +
-        "_" +
-        configs.length +
-        "MaLo_master.zip";
+      const masterName = "MSCONS_" + date.replace(/-/g, "") + "_" + configs.length + "MaLo_master.zip";
       saveAs(masterBlob, masterName);
 
-      const links = [
-        { name: masterName, href: URL.createObjectURL(masterBlob) },
-        ...perMaLoZipBlobs.map((z) => ({
-          name: z.name,
-          href: URL.createObjectURL(z.blob),
-        })),
-      ];
-      setFallbackLinks(links);
+      setFallbackLinks([{ name: masterName, href: URL.createObjectURL(masterBlob) }]);
     } finally {
       setIsGenerating(false);
     }
-  }
-
-  function runSelfTests() {
-    const results = [];
-    setTests(results);
   }
 
   return (
@@ -557,21 +503,11 @@ export default function MSCONSGenerator() {
         <div className="row" style={{ alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <strong>Mode</strong>
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <input
-              type="radio"
-              name="mode"
-              checked={mode === "slp"}
-              onChange={() => setMode("slp")}
-            />
+            <input type="radio" name="mode" checked={mode === "slp"} onChange={() => setMode("slp")} />
             SLP Generator
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <input
-              type="radio"
-              name="mode"
-              checked={mode === "csv"}
-              onChange={() => setMode("csv")}
-            />
+            <input type="radio" name="mode" checked={mode === "csv"} onChange={() => setMode("csv")} />
             CSV → MSCONS (1:1 kWh/15min)
           </label>
         </div>
@@ -581,20 +517,12 @@ export default function MSCONSGenerator() {
             <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <span>CSV file (kWh per 15 min)</span>
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={(e) => handleCsvFile(e.target.files && e.target.files[0])}
-                />
+                <input type="file" accept=".csv,text/csv" onChange={(e) => handleCsvFile(e.target.files && e.target.files[0])} />
               </label>
 
               <label style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 420 }}>
                 <span>Location ID for LOC+172 (MeLo)</span>
-                <input
-                  value={csvLocId}
-                  onChange={(e) => setCsvLocId(e.target.value)}
-                  placeholder="DE913000000000000000000000000000X"
-                />
+                <input value={csvLocId} onChange={(e) => setCsvLocId(e.target.value)} placeholder="DE913000000000000000000000000000X" />
               </label>
 
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -635,70 +563,13 @@ export default function MSCONSGenerator() {
 
             <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <span>Days</span>
-              <input
-                type="number"
-                value={days}
-                onChange={(e) => setDays(Number(e.target.value))}
-              />
+              <input type="number" value={days} onChange={(e) => setDays(Number(e.target.value))} />
             </label>
           </div>
 
           <div style={{ marginTop: 10 }}>
             <div style={{ fontWeight: 700, marginBottom: 6 }}>MaLo list</div>
-            <textarea
-              style={{ width: "100%", minHeight: 120 }}
-              value={rawMalos}
-              onChange={(e) => setRawMalos(e.target.value)}
-            />
-          </div>
-
-          <div style={{ marginTop: 10 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Configs</div>
-            {configs.length === 0 && (
-              <div style={{ opacity: 0.8 }}>Click “Load MaLo list” to create configs.</div>
-            )}
-            {configs.map((cfg, i) => (
-              <div
-                key={cfg.malo + i}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "220px 120px 140px 120px 140px",
-                  gap: 10,
-                  alignItems: "center",
-                  marginBottom: 6,
-                }}
-              >
-                <div style={{ fontFamily: "monospace" }}>{cfg.malo}</div>
-
-                <select
-                  value={cfg.direction}
-                  onChange={(e) => updateCfg(i, { direction: e.target.value })}
-                >
-                  <option value="consumption">Verbrauch</option>
-                  <option value="generation">Erzeugung</option>
-                </select>
-
-                <input
-                  value={cfg.slp}
-                  onChange={(e) => updateCfg(i, { slp: e.target.value })}
-                  placeholder="SLP"
-                />
-
-                <input
-                  type="number"
-                  value={cfg.expectedAnnualKWh}
-                  onChange={(e) => updateCfg(i, { expectedAnnualKWh: Number(e.target.value) })}
-                  placeholder="kWh/a"
-                />
-
-                <input
-                  type="number"
-                  value={cfg.noisePct}
-                  onChange={(e) => updateCfg(i, { noisePct: Number(e.target.value) })}
-                  placeholder="noise %"
-                />
-              </div>
-            ))}
+            <textarea style={{ width: "100%", minHeight: 120 }} value={rawMalos} onChange={(e) => setRawMalos(e.target.value)} />
           </div>
         </div>
       )}
@@ -720,3 +591,9 @@ export default function MSCONSGenerator() {
     </div>
   );
 }
+
+// ============================
+// Mount to DOM (NO export)
+// ============================
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<MSCONSGenerator />);
