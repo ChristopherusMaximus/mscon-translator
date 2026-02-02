@@ -136,31 +136,22 @@ function parseQuarterHourCSV(text) {
 // Core MSCONS builder
 // ============================
 function buildMSCONS(options) {
-  const { locId, obis, start, end, values } = options;
-
-  const now = new Date();
+  const { malo, obis, start, end, values } = options;
+  const ts = new Date();
   const rand = Math.floor(Math.random() * 9_000_000) + 1_000_000;
-
-  const interchangeRef = `D${rand}`;
-  const msgRef = `MS${rand}${pad(now.getUTCSeconds(), 2)}`;
+  const docId = `D${rand}`;
+  const msgRef = `MS${rand}${pad(ts.getUTCSeconds(), 2)}`;
 
   const segments = [];
   segments.push("UNA:+.? '");
-
-  // UNB timestamp (keep like legacy: YYMMDD:HHMM)
-  // We use UTC here to be consistent.
-  const unbStamp =
-    `${pad(now.getUTCFullYear() % 100)}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
-    `:${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
-
   segments.push(
     seg(
       "UNB",
       "UNOC:3",
       `${SENDER_ID}:500`,
       `${RECIPIENT_ID}:500`,
-      unbStamp,
-      interchangeRef,
+      `${pad(ts.getUTCFullYear() % 100)}${pad(ts.getUTCMonth() + 1)}${pad(ts.getUTCDate())}:${pad(ts.getUTCHours())}${pad(ts.getUTCMinutes())}`,
+      docId,
       "",
       APP_CODE
     )
@@ -169,48 +160,33 @@ function buildMSCONS(options) {
   const msg = [];
   msg.push(seg("UNH", msgRef, "MSCONS:D:04B:UN:2.4c"));
   msg.push(seg("BGM", "Z48", msgRef, "9"));
-  msg.push(seg("DTM", `137:${formatEdifactDateTime(now)}:303`));
+  msg.push(seg("DTM", `137:${formatEdifactDateTime(ts)}:303`));
   msg.push(seg("RFF", "Z13:13025"));
   msg.push(seg("NAD", "MS", `${SENDER_ID}::293`));
   msg.push(seg("NAD", "MR", `${RECIPIENT_ID}::293`));
   msg.push(seg("UNS", "D"));
-// IMPORTANT: workaround for platform parser
-// It expects NAD+DP+... (at least one more element) - otherwise it may misread next segment (LOC)
-   msg.push(seg("NAD", "DP", ""));
-
-   msg.push(seg("LOC", "172", locId));
-
-  // Header boundaries MUST match settlement day convention (22:00Z..22:00Z)
+  msg.push(seg("NAD", "DP"));
+  msg.push(seg("LOC", "172", malo));
   msg.push(seg("DTM", `163:${formatEdifactDateTime(start)}:303`));
   msg.push(seg("DTM", `164:${formatEdifactDateTime(end)}:303`));
-
   msg.push(seg("LIN", "1"));
   msg.push(seg("PIA", "5", `1-0?:${obis}:SRW`));
-
-  // initial QTY (non-zero, matches working examples and avoids strict parser crashes)
-  const firstVal = values && values.length ? values[0] : 0.001;
-  const initVal = Math.max(0.001, Number(firstVal) || 0.001);
-  msg.push(seg("QTY", `220:${initVal.toFixed(3)}`));
 
   let t = new Date(start.getTime());
   for (const v of values) {
     const tNext = new Date(t.getTime() + SLOT_MS);
+    msg.push(seg("QTY", `220:${Number(v.toFixed(3))}`));
     msg.push(seg("DTM", `163:${formatEdifactDateTime(t)}:303`));
     msg.push(seg("DTM", `164:${formatEdifactDateTime(tNext)}:303`));
-
-    const num = Number.isFinite(v) ? Number(v) : 0;
-    const out = num.toFixed(6).replace(/0+$/, "").replace(/\.$/, "") || "0";
-    msg.push(seg("QTY", `220:${out}`));
-
     t = tNext;
   }
-
   msg.push(seg("UNT", String(msg.length + 1), msgRef));
 
-  segments.push(...msg);
-  segments.push(seg("UNZ", "1", interchangeRef));
+  segments.push.apply(segments, msg);
+  segments.push(seg("UNZ", "1", docId));
   return segments.join("");
 }
+
 
 // ============================
 // (SLP / PV placeholders - kept minimal)
