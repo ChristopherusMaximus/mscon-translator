@@ -58,12 +58,13 @@ function parseQuarterHourCSV(text) {
 
   const rows = [];
   for (const line of lines) {
-    // expecting: "DD.MM.YYYY HH:MM;... , <value>"
-    const parts = line.split(",");
+    // Expected: "DD.MM.YYYY HH:MM;15,024"
+    const parts = line.split(";");
     if (parts.length < 2) continue;
 
-    const left = (parts[0] || "").split(";")[0].trim();
-    const valStr = (parts[1] || "").trim().replace(",", "."); // safety
+    const left = parts[0].trim();          // "DD.MM.YYYY HH:MM"
+    const valStrRaw = parts[1].trim();     // "15,024"
+    const valStr = valStrRaw.replace(",", "."); // "15.024"
 
     const m = left.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$/);
     if (!m) continue;
@@ -74,39 +75,38 @@ function parseQuarterHourCSV(text) {
     const HH = Number(m[4]);
     const MM = Number(m[5]);
 
-    const ts = new Date(yy, mm - 1, dd, HH, MM); // LOCAL CLOCK
+    // local timestamp = interval START
+    const ts = new Date(yy, mm - 1, dd, HH, MM);
     const v = Number(valStr);
+
     rows.push({ ts, v: Number.isFinite(v) ? v : 0 });
   }
 
   rows.sort((a, b) => a.ts - b.ts);
 
   // group by local day
-  const byDay = new Map(); // YYYY-MM-DD -> rows
+  const byDay = new Map(); // key YYYY-MM-DD -> array of {ts,v}
   for (const r of rows) {
     const k = `${r.ts.getFullYear()}-${pad(r.ts.getMonth() + 1)}-${pad(r.ts.getDate())}`;
     if (!byDay.has(k)) byDay.set(k, []);
     byDay.get(k).push(r);
   }
 
-  const dayKeys = Array.from(byDay.keys()).sort();
+  // build 96-value arrays per day (fill missing with 0)
+  const days = Array.from(byDay.keys()).sort();
   const result = [];
 
-  for (const dayKey of dayKeys) {
+  for (const dayKey of days) {
     const [Y, M, D] = dayKey.split("-").map(Number);
-
-    // local day start/end (00:00 to 24:00)
     const start = new Date(Y, M - 1, D, 0, 0, 0, 0);
-    const end = new Date(start.getTime() + 24 * 3600 * 1000);
 
-    // build expected 96 timestamps
+    // expected 96 timestamps
     const expected = new Map();
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * SLOT_MS);
+      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
       expected.set(t.getTime(), 0);
     }
 
-    // fill values
     for (const r of byDay.get(dayKey)) {
       const tms = r.ts.getTime();
       if (expected.has(tms)) expected.set(tms, r.v);
@@ -114,11 +114,16 @@ function parseQuarterHourCSV(text) {
 
     const values = [];
     for (let i = 0; i < 96; i++) {
-      const t = new Date(start.getTime() + i * SLOT_MS);
+      const t = new Date(start.getTime() + i * 15 * 60 * 1000);
       values.push(expected.get(t.getTime()) || 0);
     }
 
-    result.push({ dayKey, start, end, values });
+    result.push({
+      dayKey,
+      start,
+      end: new Date(start.getTime() + 24 * 3600 * 1000),
+      values,
+    });
   }
 
   return result;
