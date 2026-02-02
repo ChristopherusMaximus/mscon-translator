@@ -492,7 +492,7 @@ function MSCONSGenerator() {
             <button onClick={addDefaultConfigs} disabled={mode === "csv"}>
               Load MaLo list
             </button>
-            <button onClick={handleGenerateZip} disabled={isGenerating}>
+            <button className="primary" onClick={handleGenerateZip} disabled={isGenerating}>
               {isGenerating ? "Generating..." : "Generate ZIP"}
             </button>
           </div>
@@ -534,7 +534,7 @@ function MSCONSGenerator() {
               </label>
             </div>
 
-            <div style={{ marginTop: 8, fontSize: 13, opacity: 0.9 }}>
+            <div className="help">
               {csvName ? (
                 <span>
                   Loaded: <strong>{csvName}</strong> — Days: <strong>{csvDays.length}</strong>
