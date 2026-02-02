@@ -9,6 +9,12 @@
 <body>
   <div id="root"></div>
 
+  <script>
+  // Shim for CommonJS bundles accidentally loaded in the browser
+  window.exports = window.exports || {};
+  window.module = window.module || { exports: window.exports };
+</script>
+
   <!-- React + ReactDOM + Babel (für JSX im Browser) -->
   <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
@@ -17,6 +23,7 @@
   <!-- JSZip & FileSaver (für ZIP-Erzeugung & Download) -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
 
   <!-- Konfiguration / Konstanten -->
   <script src="./config.js"></script>
@@ -30,3 +37,4 @@
 
 </body>
 </html>
+
