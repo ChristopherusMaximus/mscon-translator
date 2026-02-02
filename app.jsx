@@ -33,12 +33,12 @@ function pad(n, size = 2) {
 
 // Local EDIFACT date-time with "?+00" + :303 qualifier.
 // (We keep ?+00 for compatibility with your existing parser expectations.)
-function formatEdifactDateTimeLocal(date) {
-  const y = date.getFullYear();
-  const m = pad(date.getMonth() + 1);
-  const d = pad(date.getDate());
-  const hh = pad(date.getHours());
-  const mm = pad(date.getMinutes());
+function formatEdifactDateTime(date) {
+  const y = date.getUTCFullYear();
+  const m = pad(date.getUTCMonth() + 1);
+  const d = pad(date.getUTCDate());
+  const hh = pad(date.getUTCHours());
+  const mm = pad(date.getUTCMinutes());
   return `${y}${m}${d}${hh}${mm}?+00`;
 }
 
@@ -177,8 +177,10 @@ function buildMSCONS(options) {
   msg.push(seg("LIN", "1"));
   msg.push(seg("PIA", "5", `1-0?:${obis}:SRW`));
 
-  // TL working pattern: QTY+220:0 then intervals: DTM163, DTM164, QTY+220:<value>
-  msg.push(seg("QTY", "220:0"));
+  // Some parsers expect a non-zero initial quantity (matches working examples)
+const firstVal = (values && values.length ? values[0] : 0.001);
+const initVal = Math.max(0.001, Number(firstVal) || 0.001);
+msg.push(seg("QTY", `220:${initVal.toFixed(3)}`));
 
   let t = new Date(start.getTime());
   for (const v of values) {
@@ -342,9 +344,10 @@ function MSCONSGenerator() {
             kind +
             ".txt";
 
-          // EXACT local day window: 00:00..24:00
-          const startBase = new Date(d.start.getTime());
-          const endBase = new Date(d.end.getTime());
+          // IMPORTANT: Market-compatible settlement day (DE) -> 22:00 UTC to 22:00 UTC
+         // This matches your working MSCONS examples.
+            const startBase = new Date(`${d.dayKey}T22:00:00Z`);
+            const endBase = new Date(startBase.getTime() + 24 * 3600 * 1000);
 
           const content = buildMSCONS({
             locId,
