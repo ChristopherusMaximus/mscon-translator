@@ -12,7 +12,7 @@ const { useMemo, useState } = React;
 // ============================
 // Config / Constants
 // ============================
-const APP_VERSION = "2026-02-02-CSV";
+const APP_VERSION = "2026-02-05-CSV-kW-kWh";
 
 // Matches the "working TL" format you provided:
 const APP_CODE = "TL";
@@ -47,7 +47,7 @@ function seg(tag, ...parts) {
 }
 
 // ----------------------------
-// CSV helper: parse "DD.MM.YYYY HH:MM;15,024" (kWh per 15 min)
+// CSV helper: parse "DD.MM.YYYY HH:MM;15,024" (15-min values; unit chosen in UI)
 // output: [{dayKey,start,end,values(96)}]
 // ----------------------------
 function parseQuarterHourCSV(text) {
@@ -136,7 +136,8 @@ function parseQuarterHourCSV(text) {
 // Core MSCONS builder
 // ============================
 function buildMSCONS(options) {
-  const { malo, obis, start, end, values } = options;
+  const { malo, locId, obis, start, end, values } = options;
+  const loc = (locId || malo || "").trim();
   const ts = new Date();
   const rand = Math.floor(Math.random() * 9_000_000) + 1_000_000;
   const docId = `D${rand}`;
@@ -166,7 +167,7 @@ function buildMSCONS(options) {
   msg.push(seg("NAD", "MR", `${RECIPIENT_ID}::293`));
   msg.push(seg("UNS", "D"));
   msg.push(seg("NAD", "DP"));
-  msg.push(seg("LOC", "172", malo));
+  msg.push(seg("LOC", "172", loc));
   msg.push(seg("DTM", `163:${formatEdifactDateTime(start)}:303`));
   msg.push(seg("DTM", `164:${formatEdifactDateTime(end)}:303`));
   msg.push(seg("LIN", "1"));
@@ -209,7 +210,8 @@ function MSCONSGenerator() {
   const [mode, setMode] = useState("slp"); // "slp" | "csv"
 
   const [csvName, setCsvName] = useState("");
-  const [csvDays, setCsvDays] = useState([]);
+  const [csvUnit, setCsvUnit] = useState("kwh"); // "kwh" | "kw"
+  const [csvRawDays, setCsvRawDays] = useState([]); // parsed values as-is
   const [csvError, setCsvError] = useState("");
   const [csvLocId, setCsvLocId] = useState("DE913000000000000000000000000000X");
   const [csvDirection, setCsvDirection] = useState("consumption"); // consumption|generation
@@ -243,10 +245,23 @@ function MSCONSGenerator() {
     );
   }, [rawMalos]);
 
+  const csvDays = useMemo(() => {
+    if (!csvRawDays.length) return [];
+    if (csvUnit === "kwh") return csvRawDays;
+
+    // csvUnit === "kw" -> convert average kW per 15 min to kWh per 15 min
+    // 15 min = 0.25 h
+    return csvRawDays.map((d) => ({
+      ...d,
+      values: d.values.map((v) => (Number.isFinite(v) ? v * 0.25 : 0)),
+    }));
+  }, [csvRawDays, csvUnit]);
+
+
   async function handleCsvFile(file) {
     setCsvError("");
     setCsvName(file ? file.name : "");
-    setCsvDays([]);
+    setCsvRawDays([]);
     if (!file) return;
 
     try {
@@ -267,7 +282,7 @@ function MSCONSGenerator() {
         }
       }
 
-      setCsvDays(parsed);
+      setCsvRawDays(parsed);
     } catch (e) {
       setCsvError(String(e && e.message ? e.message : e));
     }
@@ -301,7 +316,7 @@ function MSCONSGenerator() {
       // =========================
       if (mode === "csv") {
         if (!csvDays.length) {
-          alert("Bitte zuerst eine CSV hochladen (kWh pro 15 min).");
+          alert("Bitte zuerst eine CSV hochladen (15-min Werte: kW oder kWh).");
           return;
         }
 
@@ -500,7 +515,7 @@ function MSCONSGenerator() {
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <input type="radio" name="mode" checked={mode === "csv"} onChange={() => setMode("csv")} />
-            CSV → MSCONS (1:1 kWh/15min)
+            CSV → MSCONS (kW oder kWh, 15-min)
           </label>
         </div>
 
@@ -508,8 +523,16 @@ function MSCONSGenerator() {
           <div style={{ marginTop: 10 }}>
             <div className="row" style={{ gap: 10, flexWrap: "wrap", alignItems: "center" }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span>CSV file (kWh per 15 min)</span>
+                <span>CSV file (15-min values)</span>
                 <input type="file" accept=".csv,text/csv" onChange={(e) => handleCsvFile(e.target.files && e.target.files[0])} />
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <span>CSV unit</span>
+                <select value={csvUnit} onChange={(e) => setCsvUnit(e.target.value)}>
+                  <option value="kwh">kWh per 15 min (energy)</option>
+                  <option value="kw">kW (average power) → converted to kWh</option>
+                </select>
               </label>
 
               <label style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 420 }}>
@@ -532,7 +555,7 @@ function MSCONSGenerator() {
                   Loaded: <strong>{csvName}</strong> — Days: <strong>{csvDays.length}</strong>
                 </span>
               ) : (
-                <span>Upload one CSV. The generator will create one TXT per day, then ZIPs per month.</span>
+                <span>Upload one CSV. Choose whether values are kW or kWh. Output MSCONS will always contain kWh per 15 min. The generator will create one TXT per day, then ZIPs per month.</span>
               )}
             </div>
 
